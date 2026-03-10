@@ -68,14 +68,16 @@ class SleepHandler(BaseHTTPRequestHandler):
             if path in ('', '/'):
                 self.send_json({
                     'name': 'Schlafschaf API',
-                    'version': '1.0',
+                    'version': '2.0',
                     'device': 'Arduino Uno Q',
+                    'algorithm': 'Cole-Kripke + FFT Spectral (no microphone)',
                     'endpoints': [
                         'GET /sessions',
                         'GET /sessions/<uuid>',
                         'GET /sessions/<uuid>/export',
                         'GET /sessions/<uuid>/chart',
                         'POST /sessions/<uuid>/analyze',
+                        'GET /calibration',
                     ]
                 })
 
@@ -146,6 +148,24 @@ class SleepHandler(BaseHTTPRequestHandler):
                     ], cwd=os.path.dirname(__file__))
                     db = Database()
                 self.send_file(chart_path, 'image/png')
+
+            # GET /calibration
+            elif path == '/calibration':
+                calib = db.get_latest_calibration()
+                if calib:
+                    from datetime import datetime
+                    self.send_json({
+                        'calibrated_at': datetime.fromtimestamp(
+                            calib['calibrated_at']).isoformat(),
+                        'baseline_mean': round(calib['baseline_mean'], 2),
+                        'baseline_std': round(calib['baseline_std'], 2),
+                        'presence_thresh': round(calib['presence_thresh'], 2),
+                        'activity_scale': round(calib['activity_scale'], 2),
+                        'sample_rate': calib['sample_rate'],
+                        'notes': calib['notes'],
+                    })
+                else:
+                    self.send_json({'error': 'Keine Kalibrierung vorhanden'}, 404)
 
             else:
                 self.send_json({'error': 'Endpoint nicht gefunden'}, 404)

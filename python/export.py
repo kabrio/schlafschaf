@@ -54,7 +54,7 @@ def build_export(session: dict, epochs: list[dict]) -> dict:
                 "end": unix_to_iso(ep['end_time']),
                 "stage": ep['stage'],
                 "movement_score": round(ep['movement_score'] or 0.0, 4),
-                "sound_score": round(ep['sound_score'] or 0.0, 4),
+                "bcg_energy": round(ep['sound_score'] or 0.0, 4),
             }
             for ep in epochs
         ],
