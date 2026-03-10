@@ -1,7 +1,10 @@
 [Unit]
-Description=Schlafschaf Sleep Tracker – Serial Collector
+Description=Schlafschaf Sleep Tracker – Serial Collector (24/7)
 Documentation=https://github.com/kabrio/schlafschaf
 After=network.target
+# Sicherstellen, dass der Serial-Port bereit ist
+After=dev-ttyACM0.device
+Wants=dev-ttyACM0.device
 
 [Service]
 Type=simple
@@ -12,6 +15,20 @@ Restart=on-failure
 RestartSec=10
 StandardOutput=append:/var/log/schlafschaf.log
 StandardError=append:/var/log/schlafschaf.log
+
+# ── CPU-Energiesparmodus (Qualcomm QRB2210) ──────────────────────────────────
+# Governor auf powersave setzen BEVOR collector startet
+# (collector.py setzt es selbst nochmal, aber sudo ist hier zuverlässiger)
+ExecStartPre=/bin/sh -c 'for cpu in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do echo powersave > $cpu 2>/dev/null || true; done'
+
+# Prozess-Priorität: niedrige CPU-Priorität (nice), aber kein RT-Limit
+Nice=5
+
+# Speicher-Limit: verhindert Speicherlecks über Tage
+MemoryMax=256M
+
+# Datei-Deskriptoren (für SQLite WAL-Modus)
+LimitNOFILE=1024
 
 [Install]
 WantedBy=multi-user.target
