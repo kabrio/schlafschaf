@@ -1,0 +1,23 @@
+# Datenbank und exportierte Dateien
+data/
+*.db
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# macOS
+.DS_Store
+*.swp
+
+# iOS/Xcode
+ios/SchlafSchaf.xcodeproj/xcuserdata/
+ios/DerivedData/
+ios/*.xcworkspace/xcuserdata/
+ios/Pods/
+
+# Logs
+*.log

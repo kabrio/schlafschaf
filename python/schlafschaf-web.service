@@ -1,0 +1,17 @@
+[Unit]
+Description=Schlafschaf Sleep Tracker – HTTP Web-Server
+Documentation=https://github.com/kabrio/schlafschaf
+After=network.target schlafschaf.service
+
+[Service]
+Type=simple
+User=arduino
+WorkingDirectory=/home/arduino/schlafschaf/python
+ExecStart=/usr/bin/python3 /home/arduino/schlafschaf/python/web_server.py --port 8080
+Restart=on-failure
+RestartSec=5
+StandardOutput=append:/var/log/schlafschaf-web.log
+StandardError=append:/var/log/schlafschaf-web.log
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,5 @@
+numpy>=1.24
+matplotlib>=3.7
+flask>=3.0
+# pyserial: apt install python3-serial  (auf Debian/Uno Q)
+# sqlite3: built-in in Python

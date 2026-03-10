@@ -1,0 +1,17 @@
+[Unit]
+Description=Schlafschaf Sleep Tracker – Serial Collector
+Documentation=https://github.com/kabrio/schlafschaf
+After=network.target
+
+[Service]
+Type=simple
+User=arduino
+WorkingDirectory=/home/arduino/schlafschaf/python
+ExecStart=/usr/bin/python3 /home/arduino/schlafschaf/python/collector.py --port /dev/ttyACM0
+Restart=on-failure
+RestartSec=10
+StandardOutput=append:/var/log/schlafschaf.log
+StandardError=append:/var/log/schlafschaf.log
+
+[Install]
+WantedBy=multi-user.target
