@@ -1,66 +1,97 @@
 /**
- * Schlafschaf v2 – Arduino Sleep Tracker
+ * Schlafschaf v3 – Arduino Sleep Tracker
  *
- * Nur MPU-6050 (kein Mikrofon), 50 Hz Abtastrate für BCG/Atembewegungsanalyse.
- * Erkennt Bettein-/Austritt über Vibrations-Spikes.
+ * ZWECK:
+ *   MPU-6050 misst Bewegungen, die durch die Matratze übertragen werden.
+ *   50 Hz Abtastrate für gute Bewegungsauflösung (Schlafphasen-Analyse
+ *   auf Python-Seite via Aktigraphie / Cole-Kripke-Algorithmus).
  *
- * Hardware:
- *   MPU-6050 SDA → A4
- *   MPU-6050 SCL → A5
- *   MPU-6050 VCC → 3.3V (oder 5V wenn Breakout-Regler vorhanden)
+ * MODI:
+ *   NORMAL    (Standard): 50 Hz, alle Daten werden per CSV gesendet
+ *   PAUSED    (Batterie): MPU schläft, keine Daten, nur Befehlsempfang
+ *   LOWPOWER  (Batterie): 1 Hz, nur Spike-Events, kein CSV-Stream
+ *             → Überbrückt Phasen, in denen Tracking nicht nötig ist
+ *
+ * BEFEHLE (von Python über Serial):
+ *   PAUSE\n      → Wechsel in PAUSED-Modus (MPU schläft, spart ~3 mA)
+ *   RESUME\n     → Zurück zu NORMAL
+ *   LOWPOWER\n   → 1 Hz Sampling, nur Spike-Events (spart ~80% CPU-Last)
+ *
+ * CSV-FORMAT: millis,ax,ay,az,gx,gy,gz   (7 Felder)
+ * EVENTS:     EVENT,BED_MOTION,<millis>
+ * STATUS:     PAUSED / RESUMED / READY / READY_NO_MPU
+ *
+ * HARDWARE:
+ *   MPU-6050 SDA → A4 (Arduino Uno) / SDA (Uno Q)
+ *   MPU-6050 SCL → A5 (Arduino Uno) / SCL (Uno Q)
+ *   MPU-6050 VCC → 3.3V
  *   MPU-6050 AD0 → GND (Adresse 0x68)
+ *   LED_PIN  13  → Status-LED (optional)
  *
- * CSV-Format: millis,ax,ay,az,gx,gy,gz   (7 Felder, KEIN Sound)
- * Ereigniszeilen: EVENT,BED_ENTRY,<millis>  oder  EVENT,BED_EXIT,<millis>
- * Baudrate: 115200
- *
- * MPU-6050 Konfiguration:
- *   - Bereich Accel:  ±2g    (16384 LSB/g) – maximale Empfindlichkeit
- *   - Bereich Gyro:   ±250°/s (131 LSB/°/s)
- *   - Sample Rate:    50 Hz (SMPLRT_DIV=19, Gyro-Basisrate 1 kHz)
- *   - DLPF:           44 Hz Bandbreite (CFG=3), kein Aliasing bei 50 Hz
+ * MPU-6050 KONFIGURATION:
+ *   Accel:  ±2g  (16384 LSB/g) – maximale Empfindlichkeit
+ *   Gyro:   ±250°/s (131 LSB/°/s)
+ *   DLPF:   44 Hz Bandbreite (CFG=3)
+ *   Rate:   50 Hz (SMPLRT_DIV=19)
  */
 
 #include <Wire.h>
 
-// I2C Adresse
+// I2C-Adresse
 #define MPU_ADDR     0x68
 
 // Register
-#define REG_PWR      0x6B   // Power Management 1
-#define REG_WHO      0x75   // WHO_AM_I
-#define REG_SMPLRT   0x19   // Sample Rate Divider
-#define REG_CONFIG   0x1A   // DLPF-Konfiguration
-#define REG_GCONFIG  0x1B   // Gyro Konfiguration
-#define REG_ACONFIG  0x1C   // Accel Konfiguration
-#define REG_ACCEL    0x3B   // Accel XH (erster Daten-Register)
+#define REG_PWR      0x6B
+#define REG_WHO      0x75
+#define REG_SMPLRT   0x19
+#define REG_CONFIG   0x1A
+#define REG_GCONFIG  0x1B
+#define REG_ACONFIG  0x1C
+#define REG_ACCEL    0x3B
 
-// Abtastrate
-#define SAMPLE_HZ    50
-#define SAMPLE_MS    (1000 / SAMPLE_HZ)   // 20 ms
+// Normal-Modus: 50 Hz
+#define SAMPLE_HZ_NORMAL    50
+#define SAMPLE_MS_NORMAL    (1000 / SAMPLE_HZ_NORMAL)   // 20 ms
 
-// Bettbelegungs-Erkennung
-// Spike: Änderung der Beschleunigungsmagnitude (raw) über einem Schwellwert
-// → deutet auf Aufsetzen / Hinlegen / Aufstehen hin
-#define SPIKE_DELTA_THRESH  3000    // raw-Einheiten (Diff. zweier aufeinander. Magnituden)
-#define SPIKE_CONFIRM_COUNT 3       // Spikes innerhalb kurzer Zeit = Event
-#define SPIKE_WINDOW_MS     2000    // Zeitfenster für Spike-Zählung (ms)
+// LowPower-Modus: 1 Hz (nur Spike-Events, kein Stream)
+#define SAMPLE_HZ_LOWPOWER  1
+#define SAMPLE_MS_LOWPOWER  1000
 
-// Status-LED (optional, Pin 13)
+// Spike-Erkennung (Bewegungspuls)
+#define SPIKE_DELTA_THRESH  3000    // raw (L1-Norm)
+#define SPIKE_CONFIRM_COUNT 3       // Anzahl Spikes für Event
+#define SPIKE_WINDOW_MS     2000    // Zeitfenster in ms
+
+// Status-LED
 #define LED_PIN 13
 
-bool mpu_ok = false;
+// ── Modus-Enum ───────────────────────────────────────────────────────────────
+enum Mode { NORMAL, PAUSED, LOWPOWER };
+static Mode current_mode = NORMAL;
+static bool mpu_ok       = false;
 
-// ── MPU-6050 initialisieren ──────────────────────────────────────────────────
-bool initMPU() {
-  // Aufwecken (Sleep-Bit löschen)
+// ── MPU-6050: Aufwecken ──────────────────────────────────────────────────────
+bool mpuWake() {
   Wire.beginTransmission(MPU_ADDR);
   Wire.write(REG_PWR);
-  Wire.write(0x00);
-  if (Wire.endTransmission(true) != 0) return false;
+  Wire.write(0x00);  // Sleep-Bit löschen
+  return Wire.endTransmission(true) == 0;
+}
+
+// ── MPU-6050: Schlafen ───────────────────────────────────────────────────────
+void mpuSleep() {
+  Wire.beginTransmission(MPU_ADDR);
+  Wire.write(REG_PWR);
+  Wire.write(0x40);  // Sleep-Bit setzen → ~6 µA
+  Wire.endTransmission(true);
+}
+
+// ── MPU-6050: Vollständig initialisieren ─────────────────────────────────────
+bool initMPU() {
+  if (!mpuWake()) return false;
   delay(100);
 
-  // WHO_AM_I prüfen (muss 0x68 sein)
+  // WHO_AM_I prüfen
   Wire.beginTransmission(MPU_ADDR);
   Wire.write(REG_WHO);
   Wire.endTransmission(false);
@@ -73,19 +104,19 @@ bool initMPU() {
   Wire.write(19);
   Wire.endTransmission(true);
 
-  // DLPF = 3: 44 Hz Bandbreite → kein Aliasing bei 50 Hz Abtastrate
+  // DLPF = 3: 44 Hz Bandbreite
   Wire.beginTransmission(MPU_ADDR);
   Wire.write(REG_CONFIG);
   Wire.write(0x03);
   Wire.endTransmission(true);
 
-  // Gyro-Bereich: ±250 °/s (maximale Auflösung)
+  // Gyro: ±250°/s
   Wire.beginTransmission(MPU_ADDR);
   Wire.write(REG_GCONFIG);
   Wire.write(0x00);
   Wire.endTransmission(true);
 
-  // Accel-Bereich: ±2g (16384 LSB/g, maximale Empfindlichkeit für BCG)
+  // Accel: ±2g (maximale Empfindlichkeit)
   Wire.beginTransmission(MPU_ADDR);
   Wire.write(REG_ACONFIG);
   Wire.write(0x00);
@@ -106,7 +137,7 @@ bool readMPU(int16_t* ax, int16_t* ay, int16_t* az,
   *ax = (Wire.read() << 8) | Wire.read();
   *ay = (Wire.read() << 8) | Wire.read();
   *az = (Wire.read() << 8) | Wire.read();
-  Wire.read(); Wire.read();  // Temperatur überspringen
+  Wire.read(); Wire.read();  // Temperatur
   *gx = (Wire.read() << 8) | Wire.read();
   *gy = (Wire.read() << 8) | Wire.read();
   *gz = (Wire.read() << 8) | Wire.read();
@@ -114,40 +145,82 @@ bool readMPU(int16_t* ax, int16_t* ay, int16_t* az,
 }
 
 // ── Spike-Erkennung ──────────────────────────────────────────────────────────
-// Ringpuffer für Spike-Zeitstempel
 static unsigned long spike_times[SPIKE_CONFIRM_COUNT];
-static uint8_t spike_count = 0;
-static int32_t last_magnitude = -1;
+static uint8_t  spike_count    = 0;
+static int32_t  last_magnitude = -1;
 
-// Gibt 1 zurück wenn ein BED_ENTRY/BED_EXIT-Event ausgelöst wird
-// (mehrere Spikes in kurzem Zeitfenster)
-int8_t checkSpike(int32_t magnitude, unsigned long now_ms) {
+// Gibt true zurück wenn ein Bewegungs-Event ausgelöst wird
+bool checkSpike(int32_t magnitude, unsigned long now_ms) {
   if (last_magnitude < 0) {
     last_magnitude = magnitude;
-    return 0;
+    return false;
   }
 
-  int32_t delta = abs(magnitude - last_magnitude);
+  int32_t delta  = abs(magnitude - last_magnitude);
   last_magnitude = magnitude;
 
   if (delta > SPIKE_DELTA_THRESH) {
-    // Spike erkannt: Zeitstempel im Ringpuffer speichern
     spike_times[spike_count % SPIKE_CONFIRM_COUNT] = now_ms;
     spike_count++;
 
     if (spike_count >= SPIKE_CONFIRM_COUNT) {
-      // Ältesten und neuesten Spike vergleichen
-      uint8_t oldest_idx = spike_count % SPIKE_CONFIRM_COUNT;
+      uint8_t oldest_idx  = spike_count % SPIKE_CONFIRM_COUNT;
       unsigned long oldest = spike_times[oldest_idx];
       if (now_ms - oldest <= (unsigned long)SPIKE_WINDOW_MS) {
-        // Reset Puffer
-        spike_count = 0;
+        spike_count    = 0;
         last_magnitude = -1;
-        return 1;  // Event!
+        return true;
       }
     }
   }
-  return 0;
+  return false;
+}
+
+// ── Serial-Befehle verarbeiten ────────────────────────────────────────────────
+// Puffer für eingehende Befehle (max. 16 Zeichen)
+static char  cmd_buf[16];
+static uint8_t cmd_len = 0;
+
+void handleSerialInput() {
+  while (Serial.available()) {
+    char c = (char)Serial.read();
+    if (c == '\n' || c == '\r') {
+      if (cmd_len > 0) {
+        cmd_buf[cmd_len] = '\0';
+        processCommand(cmd_buf);
+        cmd_len = 0;
+      }
+    } else if (cmd_len < sizeof(cmd_buf) - 1) {
+      cmd_buf[cmd_len++] = c;
+    }
+  }
+}
+
+void processCommand(const char* cmd) {
+  if (strcmp(cmd, "PAUSE") == 0) {
+    current_mode = PAUSED;
+    mpuSleep();                    // MPU in Schlafmodus → ~6 µA statt ~3.8 mA
+    digitalWrite(LED_PIN, LOW);
+    Serial.println(F("PAUSED"));
+
+  } else if (strcmp(cmd, "RESUME") == 0) {
+    current_mode = NORMAL;
+    if (mpu_ok) {
+      // MPU wieder vollständig initialisieren (nach Sleep)
+      mpu_ok = initMPU();
+      delay(50);
+    }
+    last_magnitude = -1;
+    spike_count    = 0;
+    digitalWrite(LED_PIN, HIGH);
+    delay(200);
+    digitalWrite(LED_PIN, LOW);
+    Serial.println(F("RESUMED"));
+
+  } else if (strcmp(cmd, "LOWPOWER") == 0) {
+    current_mode = LOWPOWER;
+    Serial.println(F("LOWPOWER"));
+  }
 }
 
 // ── Setup ────────────────────────────────────────────────────────────────────
@@ -159,10 +232,9 @@ void setup() {
   digitalWrite(LED_PIN, LOW);
 
   Wire.begin();
-  Wire.setClock(400000L);  // 400 kHz Fast-Mode
+  Wire.setClock(400000L);
   delay(200);
 
-  // MPU initialisieren (3 Versuche)
   for (uint8_t i = 0; i < 3; i++) {
     mpu_ok = initMPU();
     if (mpu_ok) break;
@@ -171,14 +243,12 @@ void setup() {
 
   if (mpu_ok) {
     Serial.println(F("READY"));
-    // Kurz blinken = OK
     for (uint8_t i = 0; i < 3; i++) {
       digitalWrite(LED_PIN, HIGH); delay(100);
       digitalWrite(LED_PIN, LOW);  delay(100);
     }
   } else {
     Serial.println(F("READY_NO_MPU"));
-    // Dauerhaft schnelles Blinken = Fehler
     for (uint8_t i = 0; i < 6; i++) {
       digitalWrite(LED_PIN, HIGH); delay(50);
       digitalWrite(LED_PIN, LOW);  delay(50);
@@ -187,17 +257,26 @@ void setup() {
 }
 
 // ── Haupt-Loop ───────────────────────────────────────────────────────────────
-static unsigned long next_sample_ms = 0;
-// Bettbelegungs-Tracking (vereinfacht auf Arduino-Seite)
-// Python-Seite macht die eigentliche Entscheidung – Arduino sendet nur Events
-static bool bed_likely_occupied = false;
+static unsigned long next_sample_ms  = 0;
+static bool          bed_occupied    = false;
 
 void loop() {
-  unsigned long now = millis();
+  // Serial-Befehle haben immer Vorrang
+  handleSerialInput();
 
-  // Auf nächsten Sample-Zeitpunkt warten
+  // Im PAUSED-Modus: nichts senden, nur auf Befehle warten
+  if (current_mode == PAUSED) {
+    delay(50);
+    return;
+  }
+
+  unsigned long now      = millis();
+  unsigned long interval = (current_mode == LOWPOWER)
+                           ? SAMPLE_MS_LOWPOWER
+                           : SAMPLE_MS_NORMAL;
+
   if (now < next_sample_ms) return;
-  next_sample_ms = now + SAMPLE_MS;
+  next_sample_ms = now + interval;
 
   int16_t ax = 0, ay = 0, az = 0, gx = 0, gy = 0, gz = 0;
   if (mpu_ok) {
@@ -207,23 +286,22 @@ void loop() {
     }
   }
 
-  // Magnitude berechnen (Näherung ohne sqrt für Geschwindigkeit)
-  // Für Spike-Erkennung genügt quadratische Magnitude
-  // Echter Wert: sqrt(ax²+ay²+az²), hier: max-Approximation für Speed
-  int32_t mag = (int32_t)abs(ax) + abs(ay) + abs(az);  // L1-Norm (schnell, kein sqrt)
+  // L1-Magnitude (schnell, kein sqrt nötig für Spike-Erkennung)
+  int32_t mag = (int32_t)abs(ax) + abs(ay) + abs(az);
 
-  // Spike prüfen
-  int8_t event = checkSpike(mag, now);
-  if (event) {
-    // Event-Zeile ausgeben (Python entscheidet ob BED_ENTRY oder BED_EXIT)
+  bool spike = checkSpike(mag, now);
+  if (spike) {
     Serial.print(F("EVENT,BED_MOTION,"));
     Serial.println(now);
-    bed_likely_occupied = !bed_likely_occupied;
-    digitalWrite(LED_PIN, bed_likely_occupied ? HIGH : LOW);
+    bed_occupied = !bed_occupied;
+    digitalWrite(LED_PIN, bed_occupied ? HIGH : LOW);
   }
 
-  // Reguläre CSV-Datenzeile
-  // Format: millis,ax,ay,az,gx,gy,gz
+  // Im LOWPOWER-Modus: keinen kontinuierlichen CSV-Stream senden
+  // (spart ~90% der seriellen Übertragungsarbeit)
+  if (current_mode == LOWPOWER) return;
+
+  // NORMAL: vollständige CSV-Zeile senden
   Serial.print(now);
   Serial.print(',');
   Serial.print(ax); Serial.print(',');

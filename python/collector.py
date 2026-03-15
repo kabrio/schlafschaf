@@ -1,43 +1,46 @@
 """
-Schlafschaf v2 – Serial-Daten-Collector (24/7 Betterkennungs-Modus)
+Schlafschaf v3 – Serial-Daten-Collector
 
-Kritisches Problem und Lösung:
-  ────────────────────────────────────────────────────────────────────
-  PROBLEM: Tiefschlaf ≈ leeres Bett (beide haben sehr niedrige Varianz)
-           → Reine Varianz-Schwellwerte können Tiefschlaf fälschlicherweise
-             als "Bett verlassen" interpretieren!
+GRUNDKONZEPT (Sensor im Bett):
+  Der MPU-6050 liegt irgendwo im Bett und misst Körperbewegungen,
+  die durch die Matratze übertragen werden.
 
-  LÖSUNG:  Atemfrequenz-Präsenz als primären Belegungs-Indikator nutzen.
-           - Leeres Bett:  <3% Energie in 0.1–0.5 Hz Band (nur Sensor-Rauschen)
-           - Tiefschlaf:  >10% Energie in 0.1–0.5 Hz Band (Atembewegung)
-           - Leichtschlaf: >20% Energie (deutliche Atembewegung)
-           - REM/Wach:     variable, Bewegungsenergie dominiert
+  Was der Sensor misst: Bewegungs-Intensität und -Muster (Aktigraphie)
+  Was er NICHT messen kann: Atemfrequenz oder Herzschlag
+  (Signal zu schwach bei indirekter Messung durch die Matratze)
 
-  Zusätzlich: Zeit-bewusste Exit-Erkennung
-           - Nacht (22:00–09:00): 30 Minuten Exit-Bestätigung
-           - Tag: 5 Minuten Exit-Bestätigung
-           → Verhindert Fehlalarm bei Tiefschlaf-Phasen um 2 Uhr nachts!
-  ────────────────────────────────────────────────────────────────────
+SCHLAFPHASEN via Bewegungsmuster:
+  Einschlafen:    Bewegungsintensität nimmt über ~15–30 min ab
+  Leichtschlaf:   Gelegentliche Repositionierungen (alle 5–20 min)
+  Tiefschlaf:     Sehr wenig Bewegung, lange Ruhephasen (20–45 min)
+  REM:            Etwas mehr Bewegung als Tiefschlaf
+  Aufwachen:      Zunehmende Bewegungsfrequenz und -intensität
 
-Betterkennungs-Zustandsmaschine:
-  CALIBRATING → EMPTY → CANDIDATE_ENTRY → OCCUPIED → CANDIDATE_EXIT → EMPTY
-                                    ↑_______________|
+TIEFSCHLAF vs. LEERES BETT (das Kernproblem):
+  Problem:  Tiefschlaf und leeres Bett sehen im Rohdaten-Stream identisch
+            aus – beide haben sehr niedrige Varianz.
+  Lösung:   Unterscheidung durch KONTEXT und EXIT-SIGNAL:
+  1. Kontext: Einmal SESSION gestartet = Person ist im Bett.
+              Ruhige Phase = Tiefschlaf, nicht „Bett leer".
+  2. Exit-Signal: Bett verlassen hat eine typische Signatur:
+              Bewegungspuls (Aufstehen/Hinaussteigen) gefolgt von
+              anhaltender Stille. Tiefschlaf hat diesen Puls nicht!
 
-Belegungsprüfung (Priorität):
-  1. Atemfrequenz-Energie (primär): FFT in 0.1–0.5 Hz über 30s Fenster
-  2. Varianz (sekundär, nur für Entry-Erkennung): schnelles 5s Fenster
-  Exit: BEIDE müssen fehlen + zeitabhängige Wartezeit
+VERLASSEN-ERKENNUNG (zweistufig):
+  MIT Puls:   Bewegungspuls (>2.5× Aktivitäts-Schwelle) erkannt,
+              danach Stille für 3–10 min (Tag/Nacht) → Session endet
+  OHNE Puls:  Sehr lange Stille als Fallback (z.B. leise rausgegangen):
+              10 min (Tag) / 45 min (Nacht)
 
-Hintergrund-Analyse:
-  Alle INCREMENTAL_ANALYSIS_MIN Minuten wird die aktive Session vorläufig
-  analysiert → Ergebnis sofort nach dem Aufwachen verfügbar.
-
-CPU-Energiesparmodus:
-  Beim Start wird der Linux CPU-Governor auf 'powersave' gesetzt.
-  Spart ~30-50% Leistungsaufnahme bei kontinuierlichem Betrieb.
+BETRIEBSMODI:
+  MAINS   (Netzbetrieb):  Immer aktiv, volle Funktionen
+  BATTERY (Akku-Betrieb): Nur im Schlaffenster aktiv (Standard: 23:00–09:00)
+                          Arduino pausiert außerhalb → tagelanger Akkubetrieb
+                          Verwendung: --mode battery [--sleep-start 23 --sleep-end 9]
 
 Verwendung:
-  python3 collector.py [--port /dev/ttyACM0] [--baud 115200] [--calibrate]
+  python3 collector.py [--port /dev/ttyACM0] [--mode mains|battery]
+                       [--sleep-start 23] [--sleep-end 9]
 """
 
 import argparse
@@ -58,73 +61,99 @@ import serial.tools.list_ports
 from database import Database
 from analyzer import analyze_session
 
+
+# ── Betriebsmodi ──────────────────────────────────────────────────────────────
+
+class OperatingMode(Enum):
+    MAINS   = 'mains'    # Netzbetrieb: immer aktiv
+    BATTERY = 'battery'  # Akkubetrieb: nur im Schlaffenster aktiv
+
+
 # ── Konfiguration ─────────────────────────────────────────────────────────────
 
 BAUD_RATE              = 115200
-SAMPLE_HZ              = 50
+SAMPLE_HZ              = 50        # Samples pro Sekunde
 
-# Kalibrierung (leeres Bett)
+# Kalibrierung
 CALIBRATION_SECONDS    = 60
-PRESENCE_SIGMA         = 4.0       # Varianz-Schwellwert: mean + 4σ
-ACTIVITY_SIGMA         = 6.0
+PRESENCE_SIGMA         = 4.0       # mean + Nσ für Eintrittserkennung
+ACTIVITY_SIGMA         = 6.0       # mean + Nσ für Aktivitäts-Schwelle
 
-# Atemfrequenz-Belegungserkennung (Kern-Feature)
-RESP_BAND_LO           = 0.10      # Hz
-RESP_BAND_HI           = 0.50      # Hz
-RESP_WINDOW_SEC        = 30        # Fenster für Atemanalyse (1500 Samples bei 50 Hz)
-RESP_OCCUPIED_THRESH   = 0.05      # Min. 5% Energie in Atemband → Person anwesend
-RESP_EXIT_THRESH       = 0.03      # Unter 3% → kein Atembewegung erkennbar
+# Kurzzeit-Varianzfenster (für schnelle Entry-/Activity-Erkennung)
+VARIANCE_WINDOW_SEC    = 5         # 5s = 250 Samples bei 50 Hz
 
-# Varianz-Fenster (für schnelle Entry-Erkennung, nicht für Exit)
-VARIANCE_WINDOW_SEC    = 5
-
-# Bettein-/-austritts-Zeiten
+# Eintritts-Bestätigung
 CONFIRM_ENTRY_SEC      = 20        # 20s erhöhte Aktivität → Bett belegt
 
-# Zeit-bewusste Exit-Erkennung (Schlüssel-Feature!)
-CONFIRM_EXIT_DAY_SEC   = 300       # 5 min tagsüber
-CONFIRM_EXIT_NIGHT_SEC = 1800      # 30 min nachts (kein Fehlalarm bei Tiefschlaf!)
+# ── Exit-Erkennung: zweistufig (MIT und OHNE Bewegungspuls) ──────────────────
+#
+# Bett verlassen hat eine typische Signatur im Sensor:
+#   Bewegungspuls (Aufstehen, typisch 0.5–3 Sekunden)
+#   → dann Stille (Person geht weg)
+#
+# Mit Puls: kürzere Bestätigung nötig (klares Signal)
+# Ohne Puls: sehr lange Stille (konservativ, Schutz vor Tiefschlaf-Fehlalarm)
+
+EXIT_BURST_FACTOR      = 2.5       # activity_scale × Faktor → Puls erkannt
+EXIT_BURST_WINDOW_SEC  = 60        # Zeitfenster in dem ein Puls "frisch" gilt
+
+# Bestätigung MIT erkanntem Bewegungspuls:
+CONFIRM_EXIT_BURST_DAY   = 180     # 3 min Stille nach Puls (Tag)
+CONFIRM_EXIT_BURST_NIGHT = 600     # 10 min Stille nach Puls (Nacht)
+
+# Bestätigung OHNE Bewegungspuls (Fallback, sehr konservativ):
+CONFIRM_EXIT_NOBURST_DAY   = 600   # 10 min andauernde Stille (Tag)
+CONFIRM_EXIT_NOBURST_NIGHT = 2700  # 45 min andauernde Stille (Nacht)
+#   → Schutz vor Fehlalarm: Tiefschlaf kann 20–40 min ohne Bewegung sein!
+
+# Nacht-Definition (für zeitabhängige Timeouts)
 NIGHT_START_HOUR       = 22        # 22:00 Uhr
 NIGHT_END_HOUR         = 9         # 09:00 Uhr
 
-# Schrittvibrationsvorwarnung
-STEP_DETECTION         = True
-STEP_IMPULSE_THRESH    = 0.6
-STEP_MIN_COUNT         = 4
-STEP_WINDOW_SEC        = 3.0
+# Batteriemodus: Standard-Schlaffenster
+DEFAULT_SLEEP_START    = 23        # 23:00 Uhr
+DEFAULT_SLEEP_END      = 9         # 09:00 Uhr
+
+# Arduino-Befehle (Batteriemodus)
+CMD_PAUSE              = b'PAUSE\n'    # Arduino pausiert Sampling
+CMD_RESUME             = b'RESUME\n'  # Arduino nimmt Sampling wieder auf
+CMD_LOW_POWER          = b'LOWPOWER\n'  # Arduino: 1 Hz statt 50 Hz
 
 # Hintergrund-Analyse
-INCREMENTAL_ANALYSIS_MIN = 30      # Alle 30 Minuten vorläufige Analyse
-MIN_SAMPLES_FOR_ANALYSIS = 3000    # Min. 60s Daten (bei 50 Hz) für Analyse
+INCREMENTAL_ANALYSIS_MIN = 30      # Alle 30 min vorläufige Analyse
+MIN_SAMPLES_FOR_ANALYSIS = 3000    # Mindestdaten für Analyse (60s bei 50 Hz)
 
 # Session-Mindestdauer
 MIN_SESSION_SECONDS    = 120
 
-# SQLite Commit-Intervall
-COMMIT_EVERY           = 50        # Jede N-te Zeile (bei 50 Hz = 1s)
-
-
-# ── Zustandsmaschine ──────────────────────────────────────────────────────────
-
-class BedState(Enum):
-    CALIBRATING      = auto()
-    EMPTY            = auto()
-    CANDIDATE_ENTRY  = auto()
-    OCCUPIED         = auto()
-    CANDIDATE_EXIT   = auto()
+# SQLite-Commit-Intervall
+COMMIT_EVERY           = 50        # Samples pro Commit-Batch
 
 
 # ── Hilfsfunktionen ───────────────────────────────────────────────────────────
 
 def is_night() -> bool:
-    """Ist es gerade Nacht (22:00–09:00)?"""
     h = datetime.now().hour
     return h >= NIGHT_START_HOUR or h < NIGHT_END_HOUR
 
 
-def get_confirm_exit_sec() -> int:
-    """Zeit-bewusste Exit-Bestätigungszeit."""
-    return CONFIRM_EXIT_NIGHT_SEC if is_night() else CONFIRM_EXIT_DAY_SEC
+def in_tracking_window(sleep_start: int, sleep_end: int) -> bool:
+    """Batteriemodus: Ist es gerade im aktiven Schlaf-Trackingfenster?"""
+    h = datetime.now().hour
+    if sleep_start > sleep_end:     # z.B. 23:00–09:00 (über Mitternacht)
+        return h >= sleep_start or h < sleep_end
+    else:                           # z.B. 22:00–07:00
+        return sleep_start <= h < sleep_end
+
+
+def minutes_until_window(sleep_start: int) -> float:
+    """Wie viele Minuten bis das Trackingfenster beginnt?"""
+    now = datetime.now()
+    target = now.replace(hour=sleep_start, minute=0, second=0, microsecond=0)
+    diff = (target - now).total_seconds()
+    if diff < 0:
+        diff += 86400
+    return diff / 60.0
 
 
 def find_arduino_port() -> str | None:
@@ -137,9 +166,11 @@ def find_arduino_port() -> str | None:
 
 
 def parse_line(line: str) -> tuple | None:
-    """CSV parsen: millis,ax,ay,az,gx,gy,gz (7 Felder)"""
+    """CSV parsen: millis,ax,ay,az,gx,gy,gz"""
     line = line.strip()
-    if not line or line.startswith('#') or line.startswith('READY') or line.startswith('EVENT'):
+    if not line or line.startswith('#') or line.startswith('READY') \
+            or line.startswith('EVENT') or line.startswith('SLEEPING') \
+            or line.startswith('PAUSED') or line.startswith('RESUMED'):
         return None
     parts = line.split(',')
     if len(parts) != 7:
@@ -154,95 +185,53 @@ def magnitude(ax: int, ay: int, az: int) -> float:
     return math.sqrt(ax * ax + ay * ay + az * az)
 
 
-def respiratory_energy_ratio(magnitudes: np.ndarray, fs: float) -> float:
-    """
-    Anteil der Energie im Atemfrequenzband (0.1–0.5 Hz) an der Gesamtenergie.
-
-    Dies ist der primäre Unterschied zwischen leerem Bett und Tiefschlaf:
-    - Leeres Bett:  <3%  (nur Sensor-Eigenrauschen, kein biologisches Signal)
-    - Tiefschlaf:  >10%  (regelmäßige, tiefe Atembewegung klar erkennbar)
-    - Leichtschlaf: >20% (deutliche Atembewegung)
-    - REM/Wach:    variabel, oft Bewegungsenergie dominiert
-
-    Benötigt mindestens 5 Sekunden Daten für sinnvolle FFT-Auflösung.
-    Die Frequenzauflösung beträgt 1/N·fs Hz, also bei 30s: 1/30 = 0.033 Hz.
-    """
-    n = len(magnitudes)
-    if n < int(fs * 5):
-        return 0.0
-
-    # DC-Anteil entfernen (Gravitations-Offset ist konstant)
-    sig = magnitudes - np.mean(magnitudes)
-    if np.std(sig) < 1e-10:
-        return 0.0
-
-    fft_vals = np.fft.rfft(sig)
-    freqs    = np.fft.rfftfreq(n, d=1.0 / fs)
-    power    = np.abs(fft_vals) ** 2
-    total    = float(np.sum(power))
-
-    if total < 1e-10:
-        return 0.0
-
-    resp_mask = (freqs >= RESP_BAND_LO) & (freqs <= RESP_BAND_HI)
-    return float(np.sum(power[resp_mask])) / total
-
-
 def running_variance(window: deque) -> float:
     n = len(window)
     if n < 2:
         return 0.0
-    mean = sum(window) / n
-    return sum((x - mean) ** 2 for x in window) / (n - 1)
+    arr = list(window)
+    mean = sum(arr) / n
+    return sum((x - mean) ** 2 for x in arr) / (n - 1)
 
-
-# ── CPU-Energiesparmodus ──────────────────────────────────────────────────────
 
 def setup_power_saving():
-    """
-    Qualcomm/Linux CPU-Governor auf 'powersave' setzen.
-    Spart ~30-50% Leistungsaufnahme im Dauerbetrieb.
-    Erfordert root-Rechte oder entsprechende udev-Regeln.
-    """
-    governors_path = '/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor'
-    try:
-        with open(governors_path, 'w') as f:
-            f.write('powersave')
-        # Alle CPU-Kerne
-        import glob
-        for gov_path in glob.glob('/sys/devices/system/cpu/cpu*/cpufreq/scaling_governor'):
-            try:
-                with open(gov_path, 'w') as f:
-                    f.write('powersave')
-            except Exception:
-                pass
-        print("CPU-Governor: powersave (alle Kerne)")
-    except PermissionError:
-        # Ohne root: cpupower als Fallback
+    """CPU-Governor auf 'powersave' setzen (Qualcomm QRB2210, Linux)."""
+    import glob
+    set_count = 0
+    for gov_path in glob.glob('/sys/devices/system/cpu/cpu*/cpufreq/scaling_governor'):
         try:
-            result = subprocess.run(
-                ['cpupower', 'frequency-set', '-g', 'powersave'],
-                capture_output=True, timeout=5
-            )
-            if result.returncode == 0:
-                print("CPU-Governor: powersave (via cpupower)")
-            else:
-                print("CPU-Governor: powersave nicht gesetzt (kein root)")
-        except FileNotFoundError:
-            print("CPU-Governor: cpupower nicht gefunden – manuell setzen oder als root starten")
-    except Exception as e:
-        print(f"CPU-Governor: Fehler – {e}")
+            with open(gov_path, 'w') as f:
+                f.write('powersave')
+            set_count += 1
+        except Exception:
+            pass
+    if set_count:
+        print(f"CPU-Governor: powersave ({set_count} Kern(e))")
+    else:
+        try:
+            subprocess.run(['cpupower', 'frequency-set', '-g', 'powersave'],
+                           capture_output=True, timeout=5)
+            print("CPU-Governor: powersave (via cpupower)")
+        except Exception:
+            print("CPU-Governor: nicht gesetzt (kein root oder cpupower)")
+
+
+# ── Bett-Zustandsmaschine ─────────────────────────────────────────────────────
+
+class BedState(Enum):
+    CALIBRATING      = auto()
+    EMPTY            = auto()
+    CANDIDATE_ENTRY  = auto()
+    OCCUPIED         = auto()
+    CANDIDATE_EXIT   = auto()
 
 
 # ── Hintergrund-Analyse ───────────────────────────────────────────────────────
 
 class IncrementalAnalyzer(threading.Thread):
     """
-    Führt alle INCREMENTAL_ANALYSIS_MIN Minuten eine vorläufige Analyse durch.
-    Läuft als Daemon-Thread – beendet sich automatisch mit dem Hauptprozess.
-
-    Vorteil: Direkt nach dem Aufwachen ist eine aktuelle Analyse verfügbar,
-    ohne auf das Session-Ende warten zu müssen.
+    Daemon-Thread: Führt alle 30 Minuten eine vorläufige Analyse durch.
+    Vorteil: Sofort nach dem Aufwachen ist ein aktuelles Ergebnis verfügbar.
     """
     daemon = True
 
@@ -264,15 +253,14 @@ class IncrementalAnalyzer(threading.Thread):
             sid = self.session_id
             if sid:
                 try:
-                    db = Database(self.db_path)
+                    db    = Database(self.db_path)
                     count = db.count_raw_for_session(sid)
                     if count >= MIN_SAMPLES_FOR_ANALYSIS:
                         now_str = datetime.now().strftime('%H:%M')
                         print(f"\n[{now_str}] Hintergrund-Analyse ({count} Samples)...",
                               flush=True)
                         analyze_session(sid, db)
-                        print(f"[{now_str}] Hintergrund-Analyse abgeschlossen.",
-                              flush=True)
+                        print(f"[{now_str}] Analyse aktualisiert.", flush=True)
                     db.close()
                 except Exception as e:
                     print(f"\n[Hintergrund] Analysefehler: {e}", flush=True)
@@ -281,11 +269,19 @@ class IncrementalAnalyzer(threading.Thread):
 # ── Haupt-Collector ───────────────────────────────────────────────────────────
 
 class Collector:
-    def __init__(self, port: str, db: Database, auto_analyze: bool = True):
-        self.port          = port
-        self.db            = db
-        self.auto_analyze  = auto_analyze
-        self.running       = True
+    def __init__(self, port: str, db: Database,
+                 mode: OperatingMode = OperatingMode.MAINS,
+                 sleep_start: int = DEFAULT_SLEEP_START,
+                 sleep_end:   int = DEFAULT_SLEEP_END,
+                 auto_analyze: bool = True):
+        self.port         = port
+        self.db           = db
+        self.mode         = mode
+        self.sleep_start  = sleep_start
+        self.sleep_end    = sleep_end
+        self.auto_analyze = auto_analyze
+        self.running      = True
+        self._ser: serial.Serial | None = None
 
         # Session
         self.session_id:    str | None   = None
@@ -296,46 +292,39 @@ class Collector:
         # Kalibrierung laden
         calib = db.get_latest_calibration()
         if calib:
-            self.baseline_mean     = calib['baseline_mean']
-            self.baseline_std      = calib['baseline_std']
-            self.presence_thresh   = calib['presence_thresh']
-            self.activity_scale    = calib['activity_scale']
-            self.resp_baseline     = calib.get('resp_baseline', 0.03)
-            self.calibrated        = True
-            print(f"Kalibrierung geladen: mean={self.baseline_mean:.1f}, "
+            self.baseline_mean   = calib['baseline_mean']
+            self.baseline_std    = calib['baseline_std']
+            self.presence_thresh = calib['presence_thresh']
+            self.activity_scale  = calib['activity_scale']
+            self.calibrated      = True
+            print(f"Kalibrierung: mean={self.baseline_mean:.1f}, "
                   f"std={self.baseline_std:.1f}, "
-                  f"presence_thresh={self.presence_thresh:.1f}, "
-                  f"resp_baseline={self.resp_baseline:.3f}")
+                  f"presence_thresh={self.presence_thresh:.1f}")
         else:
-            self.baseline_mean     = 0.0
-            self.baseline_std      = 0.0
-            self.presence_thresh   = 0.0
-            self.activity_scale    = 1.0
-            self.resp_baseline     = 0.02
-            self.calibrated        = False
+            self.baseline_mean   = 0.0
+            self.baseline_std    = 0.0
+            self.presence_thresh = 0.0
+            self.activity_scale  = 1.0
+            self.calibrated      = False
 
-        # Zustandsmaschine
+        # Zustand
         self.state = BedState.CALIBRATING if not self.calibrated else BedState.EMPTY
 
-        # Datenpuffer
-        # Kurzes Fenster (5s) für schnelle Entry-Erkennung via Varianz
-        self.var_window    = deque(maxlen=int(VARIANCE_WINDOW_SEC * SAMPLE_HZ))
-        # Langes Fenster (30s) für Atemfrequenz-Präsenz-Prüfung
-        self.resp_window   = deque(maxlen=int(RESP_WINDOW_SEC * SAMPLE_HZ))
+        # Datenpuffer (5s Kurzzeit-Fenster für Varianz/Aktivität)
+        self.var_window = deque(maxlen=int(VARIANCE_WINDOW_SEC * SAMPLE_HZ))
 
         # Kalibrierungspuffer
-        self.calib_buffer  = []
-        self.calib_start   = None
+        self.calib_buffer: list[float] = []
+        self.calib_start: float | None = None
 
-        # Zustandsübergangs-Zeitstempel
+        # Zeitstempel für Zustandsübergänge
         self.candidate_start: float | None = None
-        self.last_exit_check_ts: float = 0.0
 
-        # Schritterkennung
-        self.step_times: list[float] = []
-        self.last_mag = -1.0
+        # Exit-Puls-Tracking
+        # Zeitpunkt des letzten signifikanten Bewegungspulses (Aufsteh-Signal)
+        self.last_exit_burst_ts: float | None = None
 
-        # Millis-Sync
+        # Millis-Synchronisation
         self.wall_start:   float | None = None
         self.millis_start: int   | None = None
 
@@ -345,7 +334,9 @@ class Collector:
 
         # Anzeige
         self.display_counter = 0
-        self.last_resp_ratio = 0.0
+        self.last_var        = 0.0
+
+    # ── Zeitumrechnung ─────────────────────────────────────────────────────────
 
     def wall_time(self, millis: int) -> float:
         if self.wall_start is None:
@@ -353,27 +344,38 @@ class Collector:
             self.millis_start = millis
         return self.wall_start + (millis - self.millis_start) / 1000.0
 
-    def _is_resp_occupied(self) -> bool:
-        """
-        Primäre Belegungsprüfung: Atemfrequenz-Energie im 30s-Fenster.
+    # ── Aktivitäts-Prüfung ────────────────────────────────────────────────────
 
-        Tiefschlaf hat immer >10% Atemfrequenz-Energie – leeres Bett nie!
-        Diese Methode schützt vor Fehlalarmen bei langen Tiefschlafphasen.
-        """
-        if len(self.resp_window) < int(RESP_WINDOW_SEC * SAMPLE_HZ * 0.5):
-            # Zu wenig Daten im Fenster – noch kein sicheres Urteil
-            return True  # Im Zweifel: belegt (konservativ)
-        mags = np.array(self.resp_window)
-        ratio = respiratory_energy_ratio(mags, SAMPLE_HZ)
-        self.last_resp_ratio = ratio
-        return ratio > RESP_EXIT_THRESH
-
-    def _is_variance_active(self) -> bool:
-        """Sekundäre Prüfung: Kurzzeitige Varianz (für Entry-Erkennung)."""
+    def _is_active(self) -> bool:
+        """Erhöhte Bewegung (über Kalibrierungs-Schwellwert)?"""
         var = running_variance(self.var_window)
-        thresh_sq = (self.presence_thresh ** 2 / self.baseline_std
-                     if self.baseline_std > 0 else self.presence_thresh)
-        return var > thresh_sq
+        return var > (self.presence_thresh ** 2 / max(self.baseline_std, 1.0))
+
+    def _is_burst(self, mag: float) -> bool:
+        """
+        Exit-Puls: Signifikante Einzelbewegung wie beim Aufstehen.
+        Deutlich höher als normale Schlafbewegungen.
+        """
+        return mag > self.activity_scale * EXIT_BURST_FACTOR
+
+    def _burst_is_fresh(self, ts: float) -> bool:
+        """Gab es kürzlich (< EXIT_BURST_WINDOW_SEC) einen Exit-Puls?"""
+        if self.last_exit_burst_ts is None:
+            return False
+        return (ts - self.last_exit_burst_ts) < EXIT_BURST_WINDOW_SEC
+
+    def _confirm_exit_sec(self, ts: float) -> int:
+        """
+        Benötigte Stille-Dauer für Exit-Bestätigung.
+        Hängt ab von: Tageszeit UND ob ein Exit-Puls erkannt wurde.
+        """
+        night = is_night()
+        if self._burst_is_fresh(ts):
+            return CONFIRM_EXIT_BURST_NIGHT if night else CONFIRM_EXIT_BURST_DAY
+        else:
+            return CONFIRM_EXIT_NOBURST_NIGHT if night else CONFIRM_EXIT_NOBURST_DAY
+
+    # ── Session-Management ────────────────────────────────────────────────────
 
     def _start_session(self, ts: float):
         self.session_id    = self.db.create_session(start_time=ts)
@@ -381,7 +383,7 @@ class Collector:
         self.row_count     = 0
         self.bg_analyzer.set_session(self.session_id)
         now_str = datetime.fromtimestamp(ts).strftime('%H:%M:%S')
-        print(f"\n[{now_str}] BETT BELEGT → Session {self.session_id[:8]} gestartet")
+        print(f"\n[{now_str}] BETT BELEGT → Session {self.session_id[:8]}")
 
     def _end_session(self, ts: float):
         if self.session_id is None:
@@ -390,21 +392,20 @@ class Collector:
         duration = ts - (self.session_start or ts)
 
         if duration < MIN_SESSION_SECONDS:
-            self.db.conn.execute(
-                "DELETE FROM raw_data WHERE session_id = ?", (self.session_id,)
-            )
-            self.db.conn.execute(
-                "DELETE FROM sessions WHERE id = ?", (self.session_id,)
-            )
+            self.db.conn.execute("DELETE FROM raw_data WHERE session_id = ?",
+                                 (self.session_id,))
+            self.db.conn.execute("DELETE FROM sessions WHERE id = ?",
+                                 (self.session_id,))
             self.db.flush()
-            print(f"\nSession {self.session_id[:8]} verworfen (zu kurz: {duration:.0f}s)")
+            print(f"\nSession {self.session_id[:8]} verworfen "
+                  f"(zu kurz: {duration:.0f}s)")
         else:
             self.db.end_session(self.session_id, end_time=ts)
             now_str = datetime.fromtimestamp(ts).strftime('%H:%M:%S')
             print(f"\n[{now_str}] BETT LEER → Session {self.session_id[:8]} "
-                  f"beendet ({duration/60:.1f} min, {self.row_count} Samples)")
+                  f"beendet ({duration / 60:.1f} min, {self.row_count} Samples)")
             if self.auto_analyze and self.row_count >= MIN_SAMPLES_FOR_ANALYSIS:
-                print("Abschluss-Analyse...")
+                print("Abschluss-Analyse...", flush=True)
                 try:
                     analyze_session(self.session_id, self.db)
                     print("Analyse abgeschlossen.")
@@ -415,77 +416,51 @@ class Collector:
         self.session_start = None
         self.row_count     = 0
 
+    # ── Kalibrierung ──────────────────────────────────────────────────────────
+
     def _calibrate(self, mag: float, ts: float):
-        """60-Sekunden Baseline-Kalibrierung bei leerem Bett."""
         if self.calib_start is None:
             self.calib_start = ts
-            print(f"Kalibrierung gestartet ({CALIBRATION_SECONDS}s) – "
-                  f"Bitte sicherstellen, dass das Bett LEER ist!", flush=True)
+            print(f"Kalibrierung ({CALIBRATION_SECONDS}s) – "
+                  f"Bett muss LEER sein!", flush=True)
 
         self.calib_buffer.append(mag)
         elapsed = ts - self.calib_start
 
         if len(self.calib_buffer) % (SAMPLE_HZ * 10) == 0:
-            print(f"  Kalibrierung: {elapsed:.0f}/{CALIBRATION_SECONDS}s...", flush=True)
+            print(f"  {elapsed:.0f}/{CALIBRATION_SECONDS}s...", flush=True)
 
         if elapsed >= CALIBRATION_SECONDS:
-            import statistics
             buf  = np.array(self.calib_buffer)
             mean = float(np.mean(buf))
             std  = float(np.std(buf))
 
-            # Atemenergie-Baseline im leeren Bett (muss < RESP_EXIT_THRESH sein)
-            resp_baseline = respiratory_energy_ratio(buf, SAMPLE_HZ)
-
-            presence_thresh = mean + PRESENCE_SIGMA * std
-            activity_scale  = mean + ACTIVITY_SIGMA * std
-
             self.baseline_mean   = mean
             self.baseline_std    = std
-            self.presence_thresh = presence_thresh
-            self.activity_scale  = activity_scale
-            self.resp_baseline   = resp_baseline
+            self.presence_thresh = mean + PRESENCE_SIGMA * std
+            self.activity_scale  = mean + ACTIVITY_SIGMA * std
             self.calibrated      = True
 
-            # In DB speichern (Tabelle hat noch kein resp_baseline Feld – als note)
             self.db.save_calibration(
                 baseline_mean   = mean,
                 baseline_std    = std,
-                presence_thresh = presence_thresh,
-                activity_scale  = activity_scale,
+                presence_thresh = self.presence_thresh,
+                activity_scale  = self.activity_scale,
                 sample_rate     = SAMPLE_HZ,
-                notes           = (f"Auto-Kalibrierung {datetime.now().strftime('%d.%m.%Y %H:%M')}, "
-                                   f"resp_baseline={resp_baseline:.4f}")
+                notes           = (f"Auto-Kalibrierung "
+                                   f"{datetime.now().strftime('%d.%m.%Y %H:%M')}"),
             )
 
-            print(f"Kalibrierung abgeschlossen:")
-            print(f"  Baseline:         {mean:.1f} ± {std:.1f} raw")
-            print(f"  Präsenz-Schwellw: {presence_thresh:.1f}")
-            print(f"  Atemenergie leer: {resp_baseline:.4f} (Bett leer = kein Atmen)")
-            print(f"  Aktivitätsskala:  {activity_scale:.1f}")
-
-            if resp_baseline > RESP_EXIT_THRESH:
-                print(f"  WARNUNG: Atemenergie-Baseline ({resp_baseline:.4f}) > "
-                      f"Exit-Schwellwert ({RESP_EXIT_THRESH})!")
-                print(f"  Mögliche Ursache: Umgebungsvibrationen (Lüfter, Straße).")
-                print(f"  → RESP_EXIT_THRESH in collector.py erhöhen oder Sensor befestigen.")
+            print(f"Kalibrierung abgeschlossen:\n"
+                  f"  Baseline:        {mean:.1f} ± {std:.1f}\n"
+                  f"  Eintritts-SW:    {self.presence_thresh:.1f}\n"
+                  f"  Exit-Puls-SW:    {self.activity_scale * EXIT_BURST_FACTOR:.1f}\n"
+                  f"  Aktivitätsskala: {self.activity_scale:.1f}")
 
             self.state        = BedState.EMPTY
             self.calib_buffer = []
 
-    def _detect_footstep(self, mag: float, ts: float) -> bool:
-        """Schrittvibrations-Vorwarnung (kurze Hochfrequenz-Impulse)."""
-        if not STEP_DETECTION or self.last_mag < 0:
-            self.last_mag = mag
-            return False
-        scale = max(self.activity_scale, 1.0)
-        delta = abs(mag - self.last_mag) / scale
-        self.last_mag = mag
-        if delta > STEP_IMPULSE_THRESH:
-            self.step_times.append(ts)
-        cutoff = ts - STEP_WINDOW_SEC
-        self.step_times = [t for t in self.step_times if t > cutoff]
-        return len(self.step_times) >= STEP_MIN_COUNT
+    # ── Haupt-Verarbeitung ────────────────────────────────────────────────────
 
     def process_sample(self, millis: int,
                        ax: int, ay: int, az: int,
@@ -493,42 +468,36 @@ class Collector:
         ts  = self.wall_time(millis)
         mag = magnitude(ax, ay, az)
 
-        # ── Kalibrierung ─────────────────────────────────────────────────────
         if self.state == BedState.CALIBRATING:
             self._calibrate(mag, ts)
             return
 
-        # ── Datenpuffer aktualisieren ────────────────────────────────────────
         self.var_window.append(mag)
-        self.resp_window.append(mag)
+        active = self._is_active()
+
+        # ── Exit-Puls erkennen (immer, auch im OCCUPIED-Zustand) ─────────────
+        if self.state == BedState.OCCUPIED and self._is_burst(mag):
+            self.last_exit_burst_ts = ts
 
         # ── Zustandsübergänge ────────────────────────────────────────────────
 
         if self.state == BedState.EMPTY:
-            footstep = self._detect_footstep(mag, ts)
-            if footstep:
-                now_str = datetime.fromtimestamp(ts).strftime('%H:%M:%S')
-                print(f"\n[{now_str}] Schritte erkannt (Vorwarnung)...", flush=True)
-                self.step_times = []
-
-            # Entry: Varianz-basiert (schnell)
-            if self._is_variance_active():
+            if active:
                 self.state           = BedState.CANDIDATE_ENTRY
                 self.candidate_start = ts
 
         elif self.state == BedState.CANDIDATE_ENTRY:
-            if not self._is_variance_active():
-                # Fehlalarm
+            if not active:
                 self.state           = BedState.EMPTY
                 self.candidate_start = None
             elif ts - self.candidate_start >= CONFIRM_ENTRY_SEC:
-                # Bestätigt: Person im Bett
                 self.state = BedState.OCCUPIED
                 self._start_session(self.candidate_start)
-                self.candidate_start = None
+                self.candidate_start    = None
+                self.last_exit_burst_ts = None   # frischer Start
 
         elif self.state == BedState.OCCUPIED:
-            # Daten speichern
+            # Daten in DB speichern
             if self.session_id:
                 self.db.insert_raw(self.session_id, ts, ax, ay, az, gx, gy, gz)
                 self.row_count  += 1
@@ -537,112 +506,169 @@ class Collector:
                     self.db.flush()
                     self.commit_count = 0
 
-            # Exit-Prüfung: NUR wenn Varianz niedrig
-            # (verhindert ständige teure FFT-Berechnung)
-            if not self._is_variance_active():
-                # Nur alle 5 Sekunden die Atemfrequenz prüfen (spart CPU)
-                if ts - self.last_exit_check_ts >= 5.0:
-                    self.last_exit_check_ts = ts
-                    resp_present = self._is_resp_occupied()
-                    if not resp_present:
-                        # Weder Varianz noch Atemfrequenz → Bett-Verlassen-Kandidat
-                        if self.candidate_start is None:
-                            self.candidate_start = ts
-                            exit_sec = get_confirm_exit_sec()
-                            period_str = "Nacht" if is_night() else "Tag"
-                            now_str = datetime.fromtimestamp(ts).strftime('%H:%M:%S')
-                            print(f"\n[{now_str}] Möglicher Bett-Austritt erkannt "
-                                  f"({period_str}: {exit_sec//60} min Bestätigung nötig)...",
-                                  flush=True)
-                        elif ts - self.candidate_start >= get_confirm_exit_sec():
-                            # Zeit abgelaufen: Bett verlassen bestätigt
-                            self.state = BedState.CANDIDATE_EXIT
-                    else:
-                        # Atmung erkannt → noch im Bett (z.B. Tiefschlaf!)
-                        if self.candidate_start is not None:
-                            now_str = datetime.fromtimestamp(ts).strftime('%H:%M:%S')
-                            print(f"\n[{now_str}] Atmung erkannt – Person schläft noch "
-                                  f"(RespE={self.last_resp_ratio:.3f}). "
-                                  f"Kein Austritt.", flush=True)
-                        self.candidate_start = None
+            if not active:
+                # Keine Bewegung → Stille-Timer starten/laufen lassen
+                if self.candidate_start is None:
+                    self.candidate_start = ts
+                    needed = self._confirm_exit_sec(ts)
+                    burst_info = ("nach Puls" if self._burst_is_fresh(ts)
+                                  else "ohne Puls")
+                    period     = "Nacht" if is_night() else "Tag"
+                    now_str    = datetime.fromtimestamp(ts).strftime('%H:%M:%S')
+                    print(f"\n[{now_str}] Stille erkannt ({burst_info}, {period}: "
+                          f"{needed // 60} min Bestätigung)...", flush=True)
+                else:
+                    # Prüfen ob Timeout erreicht
+                    needed = self._confirm_exit_sec(self.candidate_start)
+                    if ts - self.candidate_start >= needed:
+                        self.state = BedState.CANDIDATE_EXIT
             else:
-                # Varianz wieder aktiv → Kandidat zurücksetzen
-                self.candidate_start = None
+                # Bewegung → Stille-Timer zurücksetzen
+                if self.candidate_start is not None:
+                    self.candidate_start = None
 
         elif self.state == BedState.CANDIDATE_EXIT:
-            # Doppelte Prüfung: Atembewegung zurückgekehrt?
-            resp_present = self._is_resp_occupied()
-            if resp_present or self._is_variance_active():
-                # Jemand ist noch/wieder im Bett
+            if active:
+                # Person wieder aktiv → noch im Bett (z.B. war kurz aufgestanden)
                 now_str = datetime.fromtimestamp(ts).strftime('%H:%M:%S')
-                print(f"\n[{now_str}] Rückkehr erkannt – Bett wieder belegt.",
-                      flush=True)
+                print(f"\n[{now_str}] Rückkehr ins Bett.", flush=True)
                 self.state           = BedState.OCCUPIED
                 self.candidate_start = None
+                self.last_exit_burst_ts = None
             else:
                 # Bett verlassen bestätigt
                 self.state = BedState.EMPTY
                 self._end_session(ts)
-                self.candidate_start = None
+                self.candidate_start    = None
+                self.last_exit_burst_ts = None
 
         # ── Fortschrittsanzeige (jede Sekunde) ───────────────────────────────
         self.display_counter += 1
+        self.last_var = running_variance(self.var_window)
         if self.display_counter >= SAMPLE_HZ:
             self.display_counter = 0
-            ts_str = datetime.fromtimestamp(ts).strftime('%H:%M:%S')
-            night_marker = ' N' if is_night() else ' T'
-            state_str = {
+            ts_str     = datetime.fromtimestamp(ts).strftime('%H:%M:%S')
+            night_mark = 'N' if is_night() else 'T'
+            mode_mark  = 'B' if self.mode == OperatingMode.BATTERY else 'M'
+            state_str  = {
                 BedState.EMPTY:           'LEER     ',
                 BedState.CANDIDATE_ENTRY: 'KOMMT... ',
                 BedState.OCCUPIED:        'BELEGT   ',
                 BedState.CANDIDATE_EXIT:  'GEHT?... ',
             }.get(self.state, '?        ')
+            # Normalisierte Aktivität (0.0–1.0 relativ zur Eintrittsschwelle)
+            thresh_sq  = (self.presence_thresh ** 2
+                          / max(self.baseline_std, 1.0))
+            activity   = min(self.last_var / max(thresh_sq, 1e-6), 9.99)
+            burst_mark = '*' if self._burst_is_fresh(ts) else ' '
             print(
-                f"\r[{ts_str}{night_marker}] {state_str} | "
-                f"RespE: {self.last_resp_ratio:.3f} | "
+                f"\r[{ts_str} {night_mark}/{mode_mark}] {state_str} | "
+                f"Akt: {activity:4.1f}{burst_mark} | "
                 f"Samples: {self.row_count}",
-                end='', flush=True
+                end='', flush=True,
             )
 
+    # ── Batteriemodus-Verwaltung ──────────────────────────────────────────────
+
+    def _send_cmd(self, cmd: bytes):
+        """Sendet einen Steuerbefehl an den Arduino."""
+        if self._ser and self._ser.is_open:
+            try:
+                self._ser.write(cmd)
+            except Exception as e:
+                print(f"\n[Arduino] Sendefehler: {e}", flush=True)
+
+    def _battery_wait_for_window(self):
+        """
+        Batteriemodus: Schläft bis das Trackingfenster beginnt.
+        Sendet während der Wartezeit einen PAUSE-Befehl an den Arduino.
+        """
+        self._send_cmd(CMD_PAUSE)
+        time.sleep(0.5)
+
+        while self.running:
+            if in_tracking_window(self.sleep_start, self.sleep_end):
+                break
+            mins = minutes_until_window(self.sleep_start)
+            now_str = datetime.now().strftime('%H:%M')
+            print(f"\r[{now_str}] Batteriemodus: Tracking beginnt um "
+                  f"{self.sleep_start:02d}:00 (in {mins:.0f} min)  ",
+                  end='', flush=True)
+            time.sleep(60)  # Jede Minute prüfen
+
+        if self.running:
+            print(f"\n[{datetime.now().strftime('%H:%M')}] Schlaffenster beginnt. "
+                  f"Tracking aktiv.", flush=True)
+            self._send_cmd(CMD_RESUME)
+            time.sleep(1)
+            # Eingangspuffer leeren
+            if self._ser:
+                self._ser.reset_input_buffer()
+
+    # ── Haupt-Loop ────────────────────────────────────────────────────────────
+
     def run(self, baud: int = BAUD_RATE):
-        """Haupt-Leseschleife mit Reconnect-Logik."""
         try:
-            ser = serial.Serial(self.port, baud, timeout=3)
+            self._ser = serial.Serial(self.port, baud, timeout=3)
         except serial.SerialException as e:
             print(f"FEHLER: {e}")
             sys.exit(1)
 
         print(f"Port:  {self.port} ({baud} baud)")
+        print(f"Modus: {self.mode.value.upper()}", end='')
+        if self.mode == OperatingMode.BATTERY:
+            print(f" (Tracking: {self.sleep_start:02d}:00–{self.sleep_end:02d}:00)", end='')
+        print()
         if self.calibrated:
-            print(f"Status: Kalibrierung vorhanden")
+            print("Kalibrierung: vorhanden")
         else:
-            print(f"Status: Keine Kalibrierung → {CALIBRATION_SECONDS}s Baseline messen")
-        print(f"Exit-Timeout: {CONFIRM_EXIT_DAY_SEC}s (Tag) / "
-              f"{CONFIRM_EXIT_NIGHT_SEC}s (Nacht)")
-        print("Warte auf Arduino... (Ctrl+C zum Beenden)\n")
+            print(f"Kalibrierung: {CALIBRATION_SECONDS}s messen (Bett muss leer sein!)")
+        print("Ctrl+C zum Beenden\n")
 
-        # Auf READY warten
-        while True:
-            raw = ser.readline()
+        # Auf Arduino-READY warten
+        deadline = time.time() + 15
+        while time.time() < deadline:
+            raw = self._ser.readline()
             if not raw:
                 continue
             line = raw.decode('utf-8', errors='ignore').strip()
             if line.startswith('READY'):
-                mpu_ok = "OK" if line == "READY" else "NICHT GEFUNDEN"
-                print(f"Arduino bereit (MPU-6050: {mpu_ok})")
+                print(f"Arduino bereit.")
                 break
 
-        # Haupt-Loop
+        # Batteriemodus: ggf. auf Tracking-Fenster warten
+        if self.mode == OperatingMode.BATTERY:
+            if not in_tracking_window(self.sleep_start, self.sleep_end):
+                self._battery_wait_for_window()
+
+        # ── Haupt-Schleife ────────────────────────────────────────────────────
         while self.running:
+
+            # Batteriemodus: Ende des Trackingfensters prüfen
+            if self.mode == OperatingMode.BATTERY:
+                if not in_tracking_window(self.sleep_start, self.sleep_end):
+                    now_str = datetime.now().strftime('%H:%M')
+                    print(f"\n[{now_str}] Schlaffenster beendet. "
+                          f"Arduino pausiert.", flush=True)
+                    if self.session_id:
+                        self.db.flush()
+                        self._end_session(time.time())
+                    self._battery_wait_for_window()
+                    continue
+
             try:
-                raw = ser.readline()
+                raw = self._ser.readline()
                 if not raw:
                     continue
                 line = raw.decode('utf-8', errors='ignore').strip()
 
                 if line.startswith('EVENT,BED_MOTION,'):
                     now_str = datetime.now().strftime('%H:%M:%S')
-                    print(f"\n[{now_str}] Arduino: Starke Bewegung", flush=True)
+                    print(f"\n[{now_str}] Arduino: Starke Bewegung erkannt",
+                          flush=True)
+                    continue
+                if line in ('PAUSED', 'RESUMED', 'SLEEPING'):
+                    print(f"\n[Arduino] {line}", flush=True)
                     continue
 
                 parsed = parse_line(line)
@@ -653,25 +679,25 @@ class Collector:
                 self.process_sample(millis, ax, ay, az, gx, gy, gz)
 
             except serial.SerialException as e:
-                print(f"\nSerial-Fehler: {e} – Reconnect in 5s...")
+                print(f"\nSerial-Fehler: {e} – Reconnect in 5s...", flush=True)
                 time.sleep(5)
                 try:
-                    ser.close()
-                    ser = serial.Serial(self.port, baud, timeout=3)
-                    print("Neu verbunden.")
+                    self._ser.close()
+                    self._ser = serial.Serial(self.port, baud, timeout=3)
+                    print("Neu verbunden.", flush=True)
                 except serial.SerialException:
                     pass
             except Exception as e:
-                print(f"\nFehler: {e}")
+                print(f"\nFehler: {e}", flush=True)
 
-        # Aufräumen
+        # ── Aufräumen ──────────────────────────────────────────────────────────
         self.bg_analyzer.stop()
         if self.session_id:
             self.db.flush()
-            self.db.end_session(self.session_id)
+            self._end_session(time.time())
         self.db.flush()
-        if ser and ser.is_open:
-            ser.close()
+        if self._ser and self._ser.is_open:
+            self._ser.close()
         print("\nCollector beendet.")
 
 
@@ -680,34 +706,49 @@ class Collector:
 def main():
     print("""
 ╔══════════════════════════════════════════╗
-║   Schlafschaf v2 – Sleep Tracker         ║
-║   24/7 Betterkennungs-Modus              ║
+║   Schlafschaf v3 – Sleep Tracker         ║
+║   Bewegungsbasierte Schlafanalyse        ║
 ╚══════════════════════════════════════════╝
 """)
 
-    parser = argparse.ArgumentParser(description='Schlafschaf Collector v2')
-    parser.add_argument('--port',       help='Serial-Port (z.B. /dev/ttyACM0)')
-    parser.add_argument('--baud',       type=int, default=BAUD_RATE)
-    parser.add_argument('--db',         default=None)
-    parser.add_argument('--calibrate',  action='store_true',
-                        help='Neu kalibrieren (leeres Bett!)')
-    parser.add_argument('--no-analyze', action='store_true',
+    parser = argparse.ArgumentParser(description='Schlafschaf Collector v3')
+    parser.add_argument('--port',         help='Serial-Port (z.B. /dev/ttyACM0)')
+    parser.add_argument('--baud',         type=int, default=BAUD_RATE)
+    parser.add_argument('--db',           default=None)
+    parser.add_argument('--mode',         choices=['mains', 'battery'],
+                        default='mains',
+                        help='mains = immer aktiv, battery = nur im Schlaffenster')
+    parser.add_argument('--sleep-start',  type=int, default=DEFAULT_SLEEP_START,
+                        help='Beginn Schlaffenster (Stunde, 0–23, Standard: 23)')
+    parser.add_argument('--sleep-end',    type=int, default=DEFAULT_SLEEP_END,
+                        help='Ende Schlaffenster (Stunde, 0–23, Standard: 9)')
+    parser.add_argument('--calibrate',    action='store_true',
+                        help='Neu kalibrieren (Bett muss leer sein!)')
+    parser.add_argument('--no-analyze',   action='store_true',
                         help='Keine automatische Analyse')
     parser.add_argument('--no-powersave', action='store_true',
                         help='CPU-Energiesparmodus nicht setzen')
     args = parser.parse_args()
 
-    # CPU-Energiesparmodus
     if not args.no_powersave:
         setup_power_saving()
 
     port = args.port or find_arduino_port()
     if not port:
-        print("FEHLER: Kein Arduino-Port. Mit --port angeben.")
+        print("FEHLER: Kein Arduino-Port gefunden. Mit --port angeben.")
         sys.exit(1)
 
-    db        = Database(args.db) if args.db else Database()
-    collector = Collector(port, db, auto_analyze=not args.no_analyze)
+    mode = OperatingMode(args.mode)
+    db   = Database(args.db) if args.db else Database()
+
+    collector = Collector(
+        port         = port,
+        db           = db,
+        mode         = mode,
+        sleep_start  = args.sleep_start,
+        sleep_end    = args.sleep_end,
+        auto_analyze = not args.no_analyze,
+    )
 
     if args.calibrate:
         collector.calibrated = False
