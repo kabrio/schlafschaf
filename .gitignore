@@ -2,6 +2,14 @@
 data/
 *.db
 
+# Training Tool – Rohdaten und Modelle (gitignore, können groß werden)
+tools/data/recordings/*.csv
+tools/data/models/*.pkl
+tools/data/models/*.png
+# Labels und Modell-Info einchecken (klein, wichtig für Reproduzierbarkeit)
+!tools/data/recordings/*.labels.json
+!tools/data/models/*.json
+
 # Python
 __pycache__/
 *.pyc
