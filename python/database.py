@@ -43,12 +43,12 @@ class Database:
                 session_id TEXT NOT NULL,
                 timestamp REAL NOT NULL,
                 sound INTEGER,
-                ax INTEGER,
-                ay INTEGER,
-                az INTEGER,
-                gx INTEGER,
-                gy INTEGER,
-                gz INTEGER,
+                ax REAL,
+                ay REAL,
+                az REAL,
+                gx REAL,
+                gy REAL,
+                gz REAL,
                 FOREIGN KEY (session_id) REFERENCES sessions(id)
             );
 
@@ -143,8 +143,8 @@ class Database:
     # ── Rohdaten ─────────────────────────────────────────────────────────────
 
     def insert_raw(self, session_id: str, timestamp: float,
-                   ax: int, ay: int, az: int,
-                   gx: int, gy: int, gz: int,
+                   ax: float, ay: float, az: float,
+                   gx: float, gy: float, gz: float,
                    sound: int | None = None):
         self.conn.execute(
             """INSERT INTO raw_data

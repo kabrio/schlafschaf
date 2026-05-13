@@ -2,8 +2,8 @@
 Schlafschaf v3 – Serial-Daten-Collector
 
 GRUNDKONZEPT (Sensor im Bett):
-  Der MPU-6050 liegt irgendwo im Bett und misst Körperbewegungen,
-  die durch die Matratze übertragen werden.
+  Der Modulino Movement (LSM6DSOX) liegt irgendwo im Bett und misst
+  Körperbewegungen, die durch die Matratze übertragen werden.
 
   Was der Sensor misst: Bewegungs-Intensität und -Muster (Aktigraphie)
   Was er NICHT messen kann: Atemfrequenz oder Herzschlag
@@ -39,7 +39,7 @@ BETRIEBSMODI:
                           Verwendung: --mode battery [--sleep-start 23 --sleep-end 9]
 
 Verwendung:
-  python3 collector.py [--port /dev/ttyACM0] [--mode mains|battery]
+  python3 collector.py [--port /var/run/arduino-router.sock] [--mode mains|battery]
                        [--sleep-start 23] [--sleep-end 9]
 """
 
@@ -156,7 +156,79 @@ def minutes_until_window(sleep_start: int) -> float:
     return diff / 60.0
 
 
+class RouterBridgePort:
+    """
+    Drop-in replacement for serial.Serial that reads/writes via the
+    arduino-router monitor TCP port (127.0.0.1:7500).
+    Used when collector.py runs on the QRB2210 Linux side of the Uno Q.
+    The sketch must use Monitor.print/println() (Router Bridge Monitor).
+
+    The arduino-router exposes a raw TCP port at 127.0.0.1:7500 where
+    Monitor data flows as plain text — no msgpack needed here.
+    """
+
+    SOCKET_PATH = '/var/run/arduino-router.sock'
+    MONITOR_HOST = '127.0.0.1'
+    MONITOR_PORT = 7500
+
+    def __init__(self, socket_path: str = SOCKET_PATH):
+        import socket as _socket
+        self._sock = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
+        self._sock.connect((self.MONITOR_HOST, self.MONITOR_PORT))
+        self._sock.settimeout(30.0)
+        self._buf    = b''
+        self._lock   = threading.Lock()
+        self.is_open = True
+
+    def write(self, data: bytes):
+        if isinstance(data, str):
+            data = data.encode()
+        try:
+            with self._lock:
+                self._sock.sendall(data)
+        except OSError as e:
+            raise serial.SerialException(f"monitor write error: {e}")
+
+    def readline(self) -> bytes:
+        while b'\n' not in self._buf:
+            try:
+                chunk = self._sock.recv(4096)
+                if not chunk:
+                    raise serial.SerialException("monitor connection closed")
+                self._buf += chunk
+            except TimeoutError:
+                pass  # no data yet, keep waiting
+        idx = self._buf.index(b'\n') + 1
+        line, self._buf = self._buf[:idx], self._buf[idx:]
+        return line
+
+    def reset_input_buffer(self):
+        with self._lock:
+            self._buf = b''
+        self._sock.settimeout(0.1)
+        try:
+            while self._sock.recv(4096):
+                pass
+        except OSError:
+            pass
+        self._sock.settimeout(30.0)
+
+    def close(self):
+        if self.is_open:
+            self.is_open = False
+            try:
+                self._sock.close()
+            except Exception:
+                pass
+
+
 def find_arduino_port() -> str | None:
+    # On-device (QRB2210 Linux): use the Router Bridge unix socket.
+    # The sketch uses Monitor (= Router Bridge), not raw UART.
+    import os
+    if os.path.exists(RouterBridgePort.SOCKET_PATH):
+        return RouterBridgePort.SOCKET_PATH
+    # Host machine: USB-attached Arduino
     ports = serial.tools.list_ports.comports()
     for p in ports:
         desc = (p.description or '').lower()
@@ -166,7 +238,9 @@ def find_arduino_port() -> str | None:
 
 
 def parse_line(line: str) -> tuple | None:
-    """CSV parsen: millis,ax,ay,az,gx,gy,gz"""
+    """CSV parsen: millis,ax,ay,az,gx,gy,gz
+    millis ist int (ms), ax/ay/az/gx/gy/gz sind float (g / dps, Modulino LSM6DSOX).
+    """
     line = line.strip()
     if not line or line.startswith('#') or line.startswith('READY') \
             or line.startswith('EVENT') or line.startswith('SLEEPING') \
@@ -176,12 +250,14 @@ def parse_line(line: str) -> tuple | None:
     if len(parts) != 7:
         return None
     try:
-        return tuple(int(p) for p in parts)
+        millis = int(parts[0])
+        ax, ay, az, gx, gy, gz = (float(p) for p in parts[1:])
+        return (millis, ax, ay, az, gx, gy, gz)
     except ValueError:
         return None
 
 
-def magnitude(ax: int, ay: int, az: int) -> float:
+def magnitude(ax: float, ay: float, az: float) -> float:
     return math.sqrt(ax * ax + ay * ay + az * az)
 
 
@@ -463,8 +539,8 @@ class Collector:
     # ── Haupt-Verarbeitung ────────────────────────────────────────────────────
 
     def process_sample(self, millis: int,
-                       ax: int, ay: int, az: int,
-                       gx: int, gy: int, gz: int):
+                       ax: float, ay: float, az: float,
+                       gx: float, gy: float, gz: float):
         ts  = self.wall_time(millis)
         mag = magnitude(ax, ay, az)
 
@@ -607,14 +683,23 @@ class Collector:
 
     # ── Haupt-Loop ────────────────────────────────────────────────────────────
 
+    def _is_ondevice_port(self) -> bool:
+        return self.port == RouterBridgePort.SOCKET_PATH
+
     def run(self, baud: int = BAUD_RATE):
         try:
-            self._ser = serial.Serial(self.port, baud, timeout=3)
-        except serial.SerialException as e:
+            if self._is_ondevice_port():
+                self._ser = RouterBridgePort(self.port)
+            else:
+                self._ser = serial.Serial(self.port, baud, timeout=3)
+        except Exception as e:
             print(f"FEHLER: {e}")
             sys.exit(1)
 
-        print(f"Port:  {self.port} ({baud} baud)")
+        if self._is_ondevice_port():
+            print(f"Port:  Router Bridge ({self.port})")
+        else:
+            print(f"Port:  {self.port} ({baud} baud)")
         print(f"Modus: {self.mode.value.upper()}", end='')
         if self.mode == OperatingMode.BATTERY:
             print(f" (Tracking: {self.sleep_start:02d}:00–{self.sleep_end:02d}:00)", end='')
@@ -683,9 +768,12 @@ class Collector:
                 time.sleep(5)
                 try:
                     self._ser.close()
-                    self._ser = serial.Serial(self.port, baud, timeout=3)
+                    if self._is_ondevice_port():
+                        self._ser = RouterBridgePort(self.port)
+                    else:
+                        self._ser = serial.Serial(self.port, baud, timeout=3)
                     print("Neu verbunden.", flush=True)
-                except serial.SerialException:
+                except Exception:
                     pass
             except Exception as e:
                 print(f"\nFehler: {e}", flush=True)
